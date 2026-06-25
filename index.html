@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FIFA World Cup 2026 Playoff Simulator v1.5.1</title>
+  <title>FIFA World Cup 2026 Playoff Simulator v1.5.2</title>
   
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -1859,6 +1859,11 @@
     const LIVE_CACHE_TTL  = 2  * 60 * 1000;         // 2 min  — for today ±3 (live/recent)
     const HIST_CACHE_TTL  = 24 * 60 * 60 * 1000;    // 24 h   — for completed historical dates
 
+    // v1.5.2: Range cache — stores the entire tournament in one localStorage entry
+    // TTL = 5 min (short enough to catch live score updates, long enough to avoid spam)
+    const RANGE_CACHE_KEY = 'wc2026_espn_range_v152';
+    const RANGE_CACHE_TTL = 5 * 60 * 1000;
+
     const _getEspnCache = (yyyymmdd) => {
       try {
         const raw = localStorage.getItem(ESPN_CACHE_PREFIX + yyyymmdd);
@@ -1879,12 +1884,13 @@
       } catch(e) { /* quota — silently skip */ }
     };
 
-    // A4: _fetchJson now accepts an optional globalSignal so the entire
-    // fetchESPNScores run can be cancelled via a global 30s timeout.
-    // Per-request timeout (8s) is always applied regardless.
-    const _fetchJson = async (url, proxyType, globalSignal) => {
+    // v1.5.2: _fetchJson now accepts optional timeoutMs (default 15s).
+    // Increased from 8s — CORS proxies adding overhead to large responses
+    // (like range queries covering 100+ matches) were silently timing out at 8s,
+    // causing "random" scores to appear (only fast-responding proxies succeeded).
+    const _fetchJson = async (url, proxyType, globalSignal, timeoutMs = 15000) => {
       const perReqCtrl = new AbortController();
-      const perReqTimeout = setTimeout(() => perReqCtrl.abort(), 8000);
+      const perReqTimeout = setTimeout(() => perReqCtrl.abort(), timeoutMs);
 
       // Forward global cancellation to per-request controller
       const onGlobalAbort = () => perReqCtrl.abort();
@@ -2021,71 +2027,124 @@
       return { events: 0, mapped: 0, reason };
     };
 
-    // v1.5.2 A3+A4: fetchESPNScores improvements:
-    //   • Global 120s AbortController — extended for cold-start with no localStorage cache (A4)
-    //   • Smart skip: historical dates fully served from cache won't hit the network (A3)
-    //   • Past WC dates now fetched in parallel BATCHES — fixes Vercel cold-start bug
-    //   • Progressive updates via onProgress callback — UI shows results as they arrive
+    // v1.5.2: fetchESPNScores — 3-strategy approach (fastest → reliable fallback)
     //
-    // BUG FIX (v1.5.2): On Vercel (new domain), localStorage is EMPTY on first visit.
-    // All 40+ tournament dates must be fetched fresh. The old sequential strategy +
-    // 30s timeout meant Jun 11-21 results were NEVER fetched before abort.
-    // Solution: batch past dates 6-at-a-time → ~6x faster, completes within timeout.
+    // ROOT CAUSE of Vercel bug (both symptoms):
+    //   1. "Missing early scores" — per-date sequential fetch + 30s timeout: Jun 11-21
+    //      dates never completed on cold start (empty localStorage on new domain).
+    //   2. "Random scores" — 8s per-request timeout was too short for CORS-proxied
+    //      responses, causing sporadic proxy failures that looked random.
+    //
+    // SOLUTION — 3 strategies, tried in order:
+    //
+    //   Strategy A: Range cache (localStorage, 5 min TTL)
+    //     Instant — no network. Warm visits serve everything from cache.
+    //
+    //   Strategy B: Single range query ?dates=20260611-20260721&limit=300
+    //     ESPN supports date ranges, returning ALL 100+ matches in ONE request.
+    //     This eliminates the 40+ individual requests problem entirely.
+    //     Per-request timeout bumped to 15s (range response is larger than single-day).
+    //
+    //   Strategy C: Per-date parallel batching (fallback if all proxies fail range query)
+    //     Batches of 6 in parallel, covers today ±3 first (live matches), then past dates.
+    //
     const fetchESPNScores = async (onProgress) => {
-      const allDates = extractFixtureDates();
       const results = {};
       let totalEvents = 0;
-      const fetchLog = [];
 
-      // A4: Global timeout — extended to 120s for cold-start (Vercel / new domain)
-      // On first visit, all 40+ dates need fresh network requests through CORS proxies.
-      // 30s was enough when cache was warm (GitHub Pages), but not for cold starts.
       const globalCtrl = new AbortController();
       const globalTimeout = setTimeout(() => {
         globalCtrl.abort();
-        console.warn('[WC2026] ⏱ Global 120s timeout — aborting remaining ESPN requests');
-      }, 120000);
-
-      // Categorize dates into 3 buckets:
-      //   priority  → today ±3: fetched in PARALLEL (may be live/in-progress)
-      //   pastDates → before today-3: fetched in parallel BATCHES (scores are final, safe)
-      //   futureDates → after today+3: fetched SEQUENTIALLY (mostly empty, low priority)
-      const todayNum = parseInt(new Date().toISOString().slice(0,10).replace(/-/g,''));
-      const priorityDates = [];
-      const pastDates = [];
-      const futureDates = [];
-      allDates.forEach(d => {
-        const diff = parseInt(d) - todayNum;
-        if (Math.abs(diff) <= 3) priorityDates.push(d);
-        else if (diff < -3) pastDates.push(d);
-        else futureDates.push(d);
-      });
+        console.warn('[WC2026] ⏱ Global 90s timeout — aborting ESPN requests');
+      }, 90000);
 
       try {
-        // 1. Priority dates — fetch in PARALLEL (live & recent matches need low latency)
-        console.log('[WC2026] Fetching', priorityDates.length, 'priority dates in parallel...');
-        const priorityResults = await Promise.allSettled(
-          priorityDates.map(d => _fetchOneDate(d, results, globalCtrl.signal))
-        );
-        priorityResults.forEach((r, i) => {
-          if (r.status === 'fulfilled' && r.value.events > 0) {
-            totalEvents += r.value.events;
-            const tag = r.value.fromCache ? '📦' : '🌐';
-            fetchLog.push(`${tag}${priorityDates[i]}: ${r.value.events}ev ${r.value.mapped}mapped`);
-          }
-        });
-        // Progressive update: push today's results to UI immediately
-        if (onProgress) onProgress(Object.assign({}, results));
 
-        // 2. Past WC dates — fetch in parallel BATCHES of 6
-        //    These are completed matches (scores final), so parallel fetching is safe.
-        //    6-at-a-time is ~6x faster than sequential, fitting within the 120s window
-        //    even on a cold start with all 14+ past dates needing fresh network requests.
+        // ── STRATEGY A: Range cache ──────────────────────────────────────────────
+        // Serve from localStorage if fresher than 5 min (covers live score updates)
+        try {
+          const raw = localStorage.getItem(RANGE_CACHE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Date.now() - parsed.ts < RANGE_CACHE_TTL) {
+              Object.assign(results, parsed.data);
+              totalEvents = Object.keys(results).length;
+              console.log(`[WC2026] 📦 Range cache hit (${totalEvents} matches)`);
+              if (onProgress) onProgress(Object.assign({}, results));
+              return { data: results, log: ['range-cache'], totalEvents };
+            }
+          }
+        } catch(e) { /* ignore localStorage errors */ }
+
+        // ── STRATEGY B: Single range query — entire tournament in ONE request ────
+        // ?dates=YYYYMMDD-YYYYMMDD is an ESPN-supported range parameter.
+        // limit=300 comfortably covers all 104 WC 2026 matches.
+        const TOURNAMENT_RANGE = '20260611-20260721';
+        let rangeSuccess = false;
+
+        console.log('[WC2026] Trying range query for full tournament...');
+        for (const endpoint of ESPN_ENDPOINTS) {
+          if (rangeSuccess || globalCtrl.signal.aborted) break;
+          const targetUrl = `${endpoint}?dates=${TOURNAMENT_RANGE}&limit=300`;
+
+          for (const proxy of ESPN_PROXIES) {
+            if (globalCtrl.signal.aborted) break;
+            try {
+              const url = proxy.wrap(targetUrl);
+              // 15s timeout for range query — larger response than single-day queries
+              const json = await _fetchJson(url, proxy.type, globalCtrl.signal, 15000);
+              const events = json.events || [];
+
+              if (events.length > 0) {
+                const mapped = _parseEvents(events, results);
+                totalEvents = events.length;
+                // Cache the full range result for 5 min
+                try {
+                  localStorage.setItem(RANGE_CACHE_KEY, JSON.stringify({ ts: Date.now(), data: results }));
+                } catch(e) { /* localStorage quota — skip */ }
+                console.log(`[WC2026] ✅ Range query: ${events.length}ev ${mapped}mapped via ${proxy.type}`);
+                if (onProgress) onProgress(Object.assign({}, results));
+                rangeSuccess = true;
+                break;
+              }
+              // Valid 0-event response → this endpoint genuinely has no data, try next endpoint
+              break;
+            } catch(e) {
+              if (e?.name === 'AbortError') break;
+              // Proxy failed (timeout / network error) → try next proxy for same endpoint
+              console.log(`[WC2026] ⚠ Range ${proxy.type} failed:`, e?.message || e);
+            }
+          }
+        }
+
+        if (rangeSuccess) {
+          return { data: results, log: [`range:${totalEvents}ev`], totalEvents };
+        }
+
+        // ── STRATEGY C: Per-date parallel batching (fallback) ────────────────────
+        // Only reached if ALL proxies failed for the range query.
+        // Fetches today±3 first (live), then all past dates in batches of 6.
+        console.log('[WC2026] Range query failed — falling back to per-date batching');
+        const allDates = extractFixtureDates();
+        const fetchLog = [];
+        const todayNum = parseInt(new Date().toISOString().slice(0,10).replace(/-/g,''));
+        const priorityDates = [];
+        const pastDates = [];
+        const futureDates = [];
+
+        allDates.forEach(d => {
+          const diff = parseInt(d) - todayNum;
+          if (Math.abs(diff) <= 3) priorityDates.push(d);
+          else if (diff < -3) pastDates.push(d);
+          else futureDates.push(d);
+        });
+
+        // Priority + past dates fetched in parallel batches of 6
+        const parallelDates = [...priorityDates, ...pastDates];
         const BATCH_SIZE = 6;
-        console.log('[WC2026] Fetching', pastDates.length, 'past WC dates in batches of', BATCH_SIZE, '...');
-        for (let bi = 0; bi < pastDates.length; bi += BATCH_SIZE) {
+        for (let bi = 0; bi < parallelDates.length; bi += BATCH_SIZE) {
           if (globalCtrl.signal.aborted) break;
-          const batch = pastDates.slice(bi, bi + BATCH_SIZE);
+          const batch = parallelDates.slice(bi, bi + BATCH_SIZE);
           const batchResults = await Promise.allSettled(
             batch.map(d => _fetchOneDate(d, results, globalCtrl.signal))
           );
@@ -2096,28 +2155,28 @@
               fetchLog.push(`${tag}${batch[k]}: ${r.value.events}ev ${r.value.mapped}mapped`);
             }
           });
-          // Progressive update after each batch — past match results appear incrementally
           if (onProgress) onProgress(Object.assign({}, results));
         }
 
-        // 3. Future dates — sequential (mostly empty responses, keep proxy traffic low)
-        console.log('[WC2026] Fetching', futureDates.length, 'future WC dates sequentially...');
+        // Future dates: sequential (mostly empty, keep proxy traffic low)
         for (const d of futureDates) {
           if (globalCtrl.signal.aborted) break;
           const r = await _fetchOneDate(d, results, globalCtrl.signal);
           if (r.events > 0) {
             totalEvents += r.events;
-            const tag = r.fromCache ? '📦' : '🌐';
-            fetchLog.push(`${tag}${d}: ${r.events}ev ${r.mapped}mapped`);
+            fetchLog.push(`${r.fromCache ? '📦' : '🌐'}${d}: ${r.events}ev ${r.mapped}mapped`);
           }
         }
+
+        console.log('[WC2026] Fallback total mapped:', Object.keys(results).length, 'from', totalEvents, 'events');
+        if (fetchLog.length) console.log('[WC2026] Dates:', fetchLog.join(' | '));
+
       } finally {
         clearTimeout(globalTimeout);
       }
 
       console.log('[WC2026] Total mapped:', Object.keys(results).length, 'from', totalEvents, 'events');
-      if (fetchLog.length) console.log('[WC2026] Mapped dates:', fetchLog.join(' | '));
-      return { data: results, log: fetchLog, totalEvents };
+      return { data: results, log: [], totalEvents };
     };
 
     // ─── LIVE SCORE BAR COMPONENT ────────────────────────────────────────────
@@ -3145,7 +3204,7 @@
               <div>
                 <h1 className="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-wc-primary to-wc-accent tracking-tighter">FIFA WORLD CUP 2026™</h1>
                 <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                  <span className="text-[10px] text-gray-600 font-mono">v1.5.1</span>
+                  <span className="text-[10px] text-gray-600 font-mono">v1.4.4</span>
                   {liveLastFetch && (
                     <span className="text-[10px] text-gray-600">
                       · ESPN: {liveLastFetch.toLocaleTimeString('id-ID', {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
