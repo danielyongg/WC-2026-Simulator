@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FIFA World Cup 2026 Playoff Simulator v1.4.4</title>
+  <title>FIFA World Cup 2026 Playoff Simulator v1.5</title>
   
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -403,7 +403,7 @@
         // Watermark
         ctx.font = '400 16px Inter, sans-serif';
         ctx.fillStyle = '#2a2a2a';
-        ctx.fillText('WC 2026 Playoff Simulator v1.2', W/2, 1860);
+        ctx.fillText('WC 2026 Playoff Simulator v1.5', W/2, 1860);
 
         // Bottom decorative line
         self._drawLine(ctx, 1895, '#c026d3', W);
@@ -955,7 +955,7 @@
 
         ctx.font = '400 14px Inter, sans-serif';
         ctx.fillStyle = '#1e1e1e';
-        ctx.fillText('WC 2026 Playoff Simulator v1.4.4', W/2, 1906);
+        ctx.fillText('WC 2026 Playoff Simulator v1.5', W/2, 1906);
 
         self._drawLine(ctx, 1920, '#c026d333', W);
 
@@ -1035,7 +1035,17 @@
         try {
           var raw = localStorage.getItem(WC_STORAGE_KEY);
           if (!raw) return null;
-          return JSON.parse(raw);
+          var s = JSON.parse(raw);
+          // C1: Validate parsed state is an object with expected structure
+          if (!s || typeof s !== 'object' || Array.isArray(s)) return null;
+          // Sanitize critical fields to guard against stale-format corruption
+          if (typeof s.phase !== 'number' || isNaN(s.phase)) s.phase = 0;
+          if (!Array.isArray(s.groupMatches)) s.groupMatches = [];
+          if (!s.bracketMatches || typeof s.bracketMatches !== 'object') {
+            s.bracketMatches = { r32:[], r16:[], qf:[], sf:[], final:[] };
+          }
+          if (!s.predictions || typeof s.predictions !== 'object') s.predictions = {};
+          return s;
         } catch(e) { return null; }
       },
       clear: function() {
@@ -1339,17 +1349,17 @@
         { date: '08 Jul 2026, 03:00 WIB', venue: 'BC Place, Vancouver' },
       ],
       qf: [
-        { date: '10 Jul 2026, 23:00 WIB', venue: 'Gillette Stadium, Boston' },
-        { date: '12 Jul 2026, 04:00 WIB', venue: 'SoFi Stadium, Los Angeles' },
-        { date: '12 Jul 2026, 02:00 WIB', venue: 'Hard Rock Stadium, Miami' },
-        { date: '13 Jul 2026, 08:00 WIB', venue: 'Arrowhead Stadium, Kansas City' },
+        { date: '10 Jul 2026, 03:00 WIB', venue: 'Gillette Stadium, Boston' },
+        { date: '11 Jul 2026, 02:00 WIB', venue: 'SoFi Stadium, Los Angeles' },
+        { date: '12 Jul 2026, 04:00 WIB', venue: 'Hard Rock Stadium, Miami' },
+        { date: '12 Jul 2026, 08:00 WIB', venue: 'Arrowhead Stadium, Kansas City' },
       ],
       sf: [
         { date: '15 Jul 2026, 02:00 WIB', venue: 'AT&T Stadium, Dallas' },
         { date: '16 Jul 2026, 02:00 WIB', venue: 'Mercedes-Benz Stadium, Atlanta' },
       ],
       final: [{ date: '20 Jul 2026, 02:00 WIB', venue: 'MetLife Stadium, New York/NJ' }],
-      third: [{ date: '19 Jul 2026, 02:00 WIB', venue: 'Hard Rock Stadium, Miami' }]
+      third: [{ date: '19 Jul 2026, 04:00 WIB', venue: 'Hard Rock Stadium, Miami' }]
     };
 
     const ANNEX_C = {
@@ -1767,13 +1777,23 @@
 
     // Parse date string like "12 Jun 2026, 02:00 WIB" to a Date object (WIB = UTC+7)
     const parseMatchDate = (dateStr) => {
+      // C3: Defensive null/type checks before any parsing
+      if (!dateStr || typeof dateStr !== 'string') return null;
       try {
         const clean = dateStr.replace(' WIB','').trim();
-        // "12 Jun 2026, 02:00"
-        const [datePart, timePart] = clean.split(', ');
-        const [day, mon, year] = datePart.split(' ');
+        if (!clean) return null;
+        const parts = clean.split(', ');
+        if (parts.length < 2) return null;
+        const [datePart, timePart] = parts;
+        const dateSplit = datePart.split(' ');
+        if (dateSplit.length < 3) return null;
+        const [day, mon, year] = dateSplit;
         const months = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
-        const [h, m] = timePart.split(':').map(Number);
+        if (months[mon] === undefined) return null;
+        const timeSplit = timePart.split(':');
+        if (timeSplit.length < 2) return null;
+        const [h, m] = timeSplit.map(Number);
+        if (isNaN(h) || isNaN(m)) return null;
         // WIB = UTC+7, so subtract 7 hours to get UTC
         return new Date(Date.UTC(parseInt(year), months[mon], parseInt(day), h - 7, m));
       } catch(e) { return null; }
@@ -1825,24 +1845,64 @@
       'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?groups=8',
     ];
 
-    // v1.3.3: Proxy chain — allorigins_raw paling cepat, corsproxy sebagai backup
+    // A1: Removed 'direct' proxy — browsers always block it with CORS errors.
+    // allorigins_raw is fastest; others are fallbacks.
     const ESPN_PROXIES = [
-      { wrap: (u) => u, type: 'direct' },
       { wrap: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, type: 'allorigins_raw' },
       { wrap: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, type: 'allorigins_json' },
       { wrap: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`, type: 'corsproxy' },
       { wrap: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`, type: 'codetabs' },
     ];
 
-    const _fetchJson = async (url, proxyType) => {
-      const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      if (proxyType === 'allorigins_json') {
-        const data = await res.json();
-        if (!data.contents) throw new Error('No contents');
-        return JSON.parse(data.contents);
+    // A2: ESPN result cache — per-date, stored in localStorage
+    const ESPN_CACHE_PREFIX = 'wc2026_espn_v15_';
+    const LIVE_CACHE_TTL  = 2  * 60 * 1000;         // 2 min  — for today ±3 (live/recent)
+    const HIST_CACHE_TTL  = 24 * 60 * 60 * 1000;    // 24 h   — for completed historical dates
+
+    const _getEspnCache = (yyyymmdd) => {
+      try {
+        const raw = localStorage.getItem(ESPN_CACHE_PREFIX + yyyymmdd);
+        if (!raw) return null;
+        const { ts, data } = JSON.parse(raw);
+        const todayStr = new Date().toISOString().slice(0,10).replace(/-/g,'');
+        const diff = Math.abs(parseInt(yyyymmdd) - parseInt(todayStr));
+        const ttl = diff <= 3 ? LIVE_CACHE_TTL : HIST_CACHE_TTL;
+        if (Date.now() - ts > ttl) return null; // expired
+        return data; // object: { 'teamA|teamB': {...}, ... }
+      } catch(e) { return null; }
+    };
+
+    const _setEspnCache = (yyyymmdd, data) => {
+      try {
+        localStorage.setItem(ESPN_CACHE_PREFIX + yyyymmdd,
+          JSON.stringify({ ts: Date.now(), data }));
+      } catch(e) { /* quota — silently skip */ }
+    };
+
+    // A4: _fetchJson now accepts an optional globalSignal so the entire
+    // fetchESPNScores run can be cancelled via a global 30s timeout.
+    // Per-request timeout (8s) is always applied regardless.
+    const _fetchJson = async (url, proxyType, globalSignal) => {
+      const perReqCtrl = new AbortController();
+      const perReqTimeout = setTimeout(() => perReqCtrl.abort(), 8000);
+
+      // Forward global cancellation to per-request controller
+      const onGlobalAbort = () => perReqCtrl.abort();
+      if (globalSignal) globalSignal.addEventListener('abort', onGlobalAbort);
+
+      try {
+        const res = await fetch(url, { signal: perReqCtrl.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (proxyType === 'allorigins_json') {
+          const data = await res.json();
+          if (!data.contents) throw new Error('No contents');
+          return JSON.parse(data.contents);
+        }
+        return res.json();
+      } finally {
+        clearTimeout(perReqTimeout);
+        if (globalSignal) globalSignal.removeEventListener('abort', onGlobalAbort);
       }
-      return res.json();
     };
 
     const _parseEvents = (events, results) => {
@@ -1903,37 +1963,81 @@
       return count;
     };
 
-    // v1.3.3: Fetch satu date dari ESPN — coba setiap endpoint+proxy sampai berhasil
-    const _fetchOneDate = async (yyyymmdd, results) => {
+    // v1.5 A2+A5: _fetchOneDate now:
+    //   • Checks localStorage cache before fetching (A2)
+    //   • Accepts globalSignal to respect the 30s global timeout (A4)
+    //   • Fixes early-exit ambiguity: a valid 0-event response for one endpoint
+    //     breaks the proxy loop but continues to the next endpoint (A5)
+    const _fetchOneDate = async (yyyymmdd, results, globalSignal) => {
+      // A2: Serve from cache if valid (not expired)
+      const cached = _getEspnCache(yyyymmdd);
+      if (cached !== null) {
+        Object.assign(results, cached);
+        const count = Object.keys(cached).length;
+        if (count > 0) console.log(`[WC2026] 📦 ${yyyymmdd} from cache (${count} matches)`);
+        return { events: count, mapped: count, fromCache: true };
+      }
+
+      // A5: Per-endpoint+proxy fetch with correct early-exit semantics
+      let gotAnyValidResponse = false;
+
       for (const endpoint of ESPN_ENDPOINTS) {
+        if (globalSignal?.aborted) return { events: 0, mapped: 0, aborted: true };
         const targetUrl = `${endpoint}?dates=${yyyymmdd}&limit=100`;
+
         for (const proxy of ESPN_PROXIES) {
+          if (globalSignal?.aborted) return { events: 0, mapped: 0, aborted: true };
           try {
             const url = proxy.wrap(targetUrl);
-            const json = await _fetchJson(url, proxy.type);
+            const json = await _fetchJson(url, proxy.type, globalSignal);
             const events = json.events || [];
+
             if (events.length > 0) {
-              const mapped = _parseEvents(events, results);
+              // Parse into a per-date staging object, then merge into global results
+              const dateResults = {};
+              const mapped = _parseEvents(events, dateResults);
+              Object.assign(results, dateResults);
+              _setEspnCache(yyyymmdd, dateResults);
               console.log(`[WC2026] ✅ ${yyyymmdd} | ${events.length}ev ${mapped}mapped via ${proxy.type}`);
               return { events: events.length, mapped };
             }
-            // 0 events — anggap OK, endpoint ini sudah respond
-            return { events: 0, mapped: 0 };
+
+            // A5 fix: valid HTTP response with 0 events means this endpoint
+            // genuinely has no matches for this date. No point retrying other
+            // proxies for the same endpoint — break to next endpoint.
+            gotAnyValidResponse = true;
+            break;
+
           } catch(e) {
-            // proxy gagal, coba berikutnya
+            if (e?.name === 'AbortError') return { events: 0, mapped: 0, aborted: true };
+            // This proxy failed — try the next one for the same endpoint
           }
         }
       }
-      return { events: 0, mapped: 0 }; // semua gagal
+
+      // Cache empty result so we don't re-fetch for this date within TTL
+      _setEspnCache(yyyymmdd, {});
+      const reason = gotAnyValidResponse ? 'no matches' : 'all proxies failed';
+      return { events: 0, mapped: 0, reason };
     };
 
+    // v1.5 A3+A4: fetchESPNScores improvements:
+    //   • Global 30s AbortController — aborts all pending requests if exceeded (A4)
+    //   • Smart skip: historical dates fully served from cache won't hit the network (A3)
     const fetchESPNScores = async () => {
       const allDates = extractFixtureDates();
       const results = {};
       let totalEvents = 0;
       const fetchLog = [];
 
-      // v1.3.3: Pisahkan "priority dates" (hari ini ±3) dari sisa WC dates
+      // A4: Global timeout — if the whole operation takes >30s, abort everything
+      const globalCtrl = new AbortController();
+      const globalTimeout = setTimeout(() => {
+        globalCtrl.abort();
+        console.warn('[WC2026] ⏱ Global 30s timeout — aborting remaining ESPN requests');
+      }, 30000);
+
+      // Separate today ±3 (priority) from the rest
       const todayStr = new Date().toISOString().slice(0,10).replace(/-/g,'');
       const priorityDates = [];
       const otherDates = [];
@@ -1943,26 +2047,34 @@
         else otherDates.push(d);
       });
 
-      // Fetch priority dates PARALLEL (untuk live & recent matches)
-      console.log('[WC2026] Fetching', priorityDates.length, 'priority dates in parallel...');
-      const priorityResults = await Promise.allSettled(
-        priorityDates.map(d => _fetchOneDate(d, results))
-      );
-      priorityResults.forEach((r, i) => {
-        if (r.status === 'fulfilled' && r.value.events > 0) {
-          totalEvents += r.value.events;
-          fetchLog.push(`${priorityDates[i]}: ${r.value.events}ev ${r.value.mapped}mapped`);
-        }
-      });
+      try {
+        // Priority dates — fetch in PARALLEL (live & recent matches need low latency)
+        console.log('[WC2026] Fetching', priorityDates.length, 'priority dates in parallel...');
+        const priorityResults = await Promise.allSettled(
+          priorityDates.map(d => _fetchOneDate(d, results, globalCtrl.signal))
+        );
+        priorityResults.forEach((r, i) => {
+          if (r.status === 'fulfilled' && r.value.events > 0) {
+            totalEvents += r.value.events;
+            const tag = r.value.fromCache ? '📦' : '🌐';
+            fetchLog.push(`${tag}${priorityDates[i]}: ${r.value.events}ev ${r.value.mapped}mapped`);
+          }
+        });
 
-      // Fetch sisa WC dates SEQUENTIAL (hemat bandwidth, tidak semua perlu)
-      console.log('[WC2026] Fetching', otherDates.length, 'other WC dates sequentially...');
-      for (const d of otherDates) {
-        const r = await _fetchOneDate(d, results);
-        if (r.events > 0) {
-          totalEvents += r.events;
-          fetchLog.push(`${d}: ${r.events}ev ${r.mapped}mapped`);
+        // Other WC dates — fetch SEQUENTIALLY (saves bandwidth; most are historical)
+        // A3: Dates fully cached will return immediately without hitting the network
+        console.log('[WC2026] Fetching', otherDates.length, 'other WC dates sequentially...');
+        for (const d of otherDates) {
+          if (globalCtrl.signal.aborted) break;
+          const r = await _fetchOneDate(d, results, globalCtrl.signal);
+          if (r.events > 0) {
+            totalEvents += r.events;
+            const tag = r.fromCache ? '📦' : '🌐';
+            fetchLog.push(`${tag}${d}: ${r.events}ev ${r.mapped}mapped`);
+          }
         }
+      } finally {
+        clearTimeout(globalTimeout);
       }
 
       console.log('[WC2026] Total mapped:', Object.keys(results).length, 'from', totalEvents, 'events');
@@ -1971,22 +2083,40 @@
     };
 
     // ─── LIVE SCORE BAR COMPONENT ────────────────────────────────────────────
-    const LiveScoreBar = ({ liveData, onApplyToGroup, onRefresh, loading, groupMatches, phase }) => {
+    // C4: Wrapped with React.memo — only re-renders when props actually change
+    // A6: Now shows both LIVE matches AND matches finished today
+    const LiveScoreBar = React.memo(({ liveData, onApplyToGroup, onRefresh, loading, groupMatches, phase }) => {
       if (phase === 0) return null;
 
-      // Hanya tampilkan pertandingan yang SEDANG BERLANGSUNG (LIVE)
-      const liveMatches = [];
+      // A6: Compute "today" in UTC for finished-today check
+      const nowUTC = new Date();
+      const todayUTCStr = `${nowUTC.getUTCFullYear()}-${String(nowUTC.getUTCMonth()+1).padStart(2,'0')}-${String(nowUTC.getUTCDate()).padStart(2,'0')}`;
+
+      const liveMatches    = [];
+      const finishedToday  = [];
+
       (groupMatches || []).forEach(m => {
-        const key1 = [m.teamA.id, m.teamB.id].sort().join('|');
-        const live = liveData[key1];
+        const key = [m.teamA.id, m.teamB.id].sort().join('|');
+        const live = liveData[key];
         if (!live) return;
-        if (live.state !== 'in') return; // HANYA LIVE
-        liveMatches.push({ match: m, live });
+
+        const isLive = live.state === 'in';
+
+        // A6: "finished today" = completed flag is true AND match date falls on UTC today
+        const isFinishedToday = live.completed === true && (() => {
+          const dt = parseMatchDate(m.date);
+          if (!dt) return false;
+          const dtStr = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth()+1).padStart(2,'0')}-${String(dt.getUTCDate()).padStart(2,'0')}`;
+          return dtStr === todayUTCStr;
+        })();
+
+        if (isLive) liveMatches.push({ match: m, live });
+        else if (isFinishedToday) finishedToday.push({ match: m, live });
       });
 
-      const hasLive = liveMatches.length > 0;
-      const totalAvailable = liveMatches.length;
-      const lastFetchEmpty = Object.keys(liveData).length === 0 && !loading;
+      const hasLive       = liveMatches.length > 0;
+      const hasFinished   = finishedToday.length > 0;
+      const hasAny        = hasLive || hasFinished;
 
       return (
         <div className="live-score-bar mb-4">
@@ -1994,11 +2124,14 @@
             <div className="flex items-center gap-2">
               {hasLive && <span className="live-dot" />}
               <span className="text-[11px] font-bold text-gray-300 uppercase tracking-widest">
-                {hasLive ? 'Live Matches' : 'Live Matches'}
+                {hasLive ? 'Live Matches' : hasFinished ? 'Hasil Hari Ini' : 'Live Matches'}
               </span>
             </div>
             {hasLive && (
-              <span className="text-[10px] text-gray-500">{totalAvailable} sedang berlangsung</span>
+              <span className="text-[10px] text-gray-500">{liveMatches.length} sedang berlangsung</span>
+            )}
+            {!hasLive && hasFinished && (
+              <span className="text-[10px] text-gray-500">{finishedToday.length} selesai hari ini</span>
             )}
             <div className="ml-auto flex items-center gap-2">
               {phase === 1 && (
@@ -2015,14 +2148,15 @@
             </div>
           </div>
 
-          {!hasLive && !loading && (
+          {!hasAny && !loading && (
             <div className="text-[11px] text-gray-600 text-center py-2">
-              Tidak ada pertandingan yang sedang berlangsung saat ini.
+              Tidak ada pertandingan live atau yang selesai hari ini.
             </div>
           )}
 
-          {hasLive && (
+          {hasAny && (
             <div className="live-scroll">
+              {/* Live matches — shown first with pulsing indicator */}
               {liveMatches.map(({match: m, live}) => {
                 const homeFirst = live.homeId === m.teamA.id;
                 const scoreA = homeFirst ? live.homeScore : live.awayScore;
@@ -2040,11 +2174,29 @@
                   </div>
                 );
               })}
+              {/* A6: Finished-today matches — teal border, FT badge */}
+              {finishedToday.map(({match: m, live}) => {
+                const homeFirst = live.homeId === m.teamA.id;
+                const scoreA = homeFirst ? live.homeScore : live.awayScore;
+                const scoreB = homeFirst ? live.awayScore : live.homeScore;
+                return (
+                  <div key={m.id} className="live-match-pill is-finished">
+                    <img src={m.teamA.flag} className="w-5 h-3.5 rounded-sm" />
+                    <span className="text-gray-300 text-[11px]">{m.teamA.name.split(' ')[0]}</span>
+                    <span className="score-highlight">{scoreA ?? '-'}</span>
+                    <span className="text-gray-600">:</span>
+                    <span className="score-highlight">{scoreB ?? '-'}</span>
+                    <span className="text-gray-300 text-[11px]">{m.teamB.name.split(' ')[0]}</span>
+                    <img src={m.teamB.flag} className="w-5 h-3.5 rounded-sm" />
+                    <span style={{fontSize:9,fontWeight:700,color:'#2dd4bf',background:'#0d3330',border:'1px solid #2dd4bf44',borderRadius:999,padding:'1px 6px'}}>FT</span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
       );
-    };
+    });
 
         // Toast helper sederhana
     window.__wcToast = (msg, type='info') => {
@@ -2152,10 +2304,14 @@
 
     // ─── BUG #1 FIX: MatchCard sebagai komponen terpisah di luar App ──────────
     // v1.4.2: tambah pred prop untuk prediction panel di knockout bracket
+    // v1.5 B2/B3: reads m.espnState & m.espnSource (synced by B2 useEffect)
+    //   — regulation inputs lock when ESPN owns the score
+    //   — penalty inputs ALWAYS remain user-controlled (ESPN has no shootout data)
+    //   — dynamic border + status badge mirrors group stage card behaviour
     const MatchCard = React.memo(({ m, topPx, titleText, titleColor, onKnockoutChange, pred }) => {
       if (!m) return null;
 
-      // v1.4.2: Knockout prediction panel logic
+      // Prediction panel logic
       const isKnockoutLocked = !!pred;
       const predResult = (isKnockoutLocked && m.played && window.WC_Tracker)
         ? window.WC_Tracker.matchResult(pred, m.gA, m.gB, true)
@@ -2164,12 +2320,42 @@
         ? (predResult.state === 'exact' ? 'correct-exact' : predResult.state === 'winner' ? 'correct-winner' : predResult.state === 'wrong' ? 'wrong' : 'locked')
         : 'locked';
 
+      // B2: ESPN state — read from match object (populated by B2 auto-sync useEffect)
+      const isESPNLive     = m.espnState === 'in';
+      const isESPNFinished = m.espnState === 'post' && m.espnSource === true;
+
+      // B3: Disable regulation inputs if ESPN-controlled; penalty inputs always manual
+      const isRegDisabled = !m.teamA || !m.teamB || isKnockoutLocked || isESPNLive || isESPNFinished;
+      const isPenDisabled  = isKnockoutLocked;
+
+      // Dynamic card border — mirrors group stage card colour logic
+      const borderStyle = isESPNLive
+        ? '1px solid rgba(239,68,68,0.55)'
+        : isESPNFinished
+          ? '1px solid rgba(45,212,191,0.25)'
+          : isKnockoutLocked
+            ? '1px solid rgba(192,38,211,0.35)'
+            : '1px solid #2d2d2d';
+
       return (
-        <div className="match-card" style={{top: topPx}}>
+        <div className="match-card" style={{top: topPx, border: borderStyle}}>
           {titleText && <div className={`absolute -top-5 left-0 w-full text-center text-[10px] font-bold tracking-wider ${titleColor}`}>{titleText}</div>}
-          <div className="text-[10px] text-gray-500 text-center font-semibold leading-tight">{m.date}</div>
+
+          {/* Date row + ESPN/LIVE status badge */}
+          <div className="flex items-center justify-center gap-2 mb-0.5">
+            <div className="text-[10px] text-gray-500 text-center font-semibold leading-tight">{m.date}</div>
+            {isESPNLive && (
+              <span className="live-badge"><span className="live-dot" style={{width:5,height:5}} />{m.displayClock || 'LIVE'}</span>
+            )}
+            {isESPNFinished && (
+              <span className="text-[9px] text-teal-500 font-bold bg-teal-900/30 px-1.5 rounded">ESPN</span>
+            )}
+          </div>
+
           {m.venue && <div className="text-[9px] text-gray-600 text-center mb-1.5 truncate">🏟 {m.venue}</div>}
-          {[['A','teamA','labelA','gA','pensA'],['B','teamB','labelB','gB','pensB']].map(([side,tk,lk,gk]) => (
+
+          {/* Team rows — regulation score inputs */}
+          {[['A','teamA','labelA','gA'],['B','teamB','labelB','gB']].map(([side,tk,lk,gk]) => (
             <div key={side} className={`flex items-center justify-between p-1.5 rounded mt-0.5 ${m.winner === m[tk]?.id ? 'bg-gray-800/80' : ''}`}>
               <div className="flex items-center gap-2 min-w-0 flex-1 pr-1">
                 <img
@@ -2185,20 +2371,40 @@
                   {m[lk] && <span className="text-[9px] text-gray-600 font-mono">{m[lk]}</span>}
                 </div>
               </div>
-              <input type="number" min="0" value={m[gk] ?? ''} onChange={e => onKnockoutChange(m.round, m.id, gk, e.target.value)} disabled={!m[tk] || isKnockoutLocked}
-                className={`w-8 h-8 text-center text-sm font-bold bg-gray-900 border rounded text-white flex-shrink-0 ${isKnockoutLocked ? 'border-gray-800 opacity-50 cursor-not-allowed' : 'border-gray-700 focus:border-wc-primary disabled:opacity-50'}`} />
+              <input
+                type="number" min="0" value={m[gk] ?? ''}
+                onChange={e => onKnockoutChange(m.round, m.id, gk, e.target.value)}
+                disabled={isRegDisabled}
+                className={`w-8 h-8 text-center text-sm font-bold bg-gray-900 border rounded text-white flex-shrink-0
+                  ${isRegDisabled
+                    ? (isESPNFinished
+                        ? 'border-teal-600/30 opacity-70 cursor-not-allowed'
+                        : 'border-gray-800 opacity-50 cursor-not-allowed')
+                    : 'border-gray-700 focus:border-wc-primary'}`}
+              />
             </div>
           ))}
+
+          {/* Penalty row — always user-controlled even when ESPN-synced */}
           {m.gA !== '' && m.gB !== '' && parseInt(m.gA) === parseInt(m.gB) && (
             <div className="flex items-center justify-center gap-1.5 mt-2.5 bg-black/50 p-2 rounded border border-gray-800">
               <span className="text-[10px] text-wc-accent font-bold">PEN:</span>
-              <input type="number" min="0" value={m.pensA ?? ''} onChange={e => onKnockoutChange(m.round, m.id, 'pensA', e.target.value)} disabled={isKnockoutLocked} className={`w-7 h-7 text-center text-[12px] font-bold bg-gray-900 border border-gray-700 rounded text-white ${isKnockoutLocked ? 'opacity-50 cursor-not-allowed' : ''}`} />
+              <input type="number" min="0" value={m.pensA ?? ''}
+                onChange={e => onKnockoutChange(m.round, m.id, 'pensA', e.target.value)}
+                disabled={isPenDisabled}
+                className={`w-7 h-7 text-center text-[12px] font-bold bg-gray-900 border border-gray-700 rounded text-white ${isPenDisabled ? 'opacity-50 cursor-not-allowed' : ''}`} />
               <span className="text-[12px] text-gray-500">-</span>
-              <input type="number" min="0" value={m.pensB ?? ''} onChange={e => onKnockoutChange(m.round, m.id, 'pensB', e.target.value)} disabled={isKnockoutLocked} className={`w-7 h-7 text-center text-[12px] font-bold bg-gray-900 border border-gray-700 rounded text-white ${isKnockoutLocked ? 'opacity-50 cursor-not-allowed' : ''}`} />
+              <input type="number" min="0" value={m.pensB ?? ''}
+                onChange={e => onKnockoutChange(m.round, m.id, 'pensB', e.target.value)}
+                disabled={isPenDisabled}
+                className={`w-7 h-7 text-center text-[12px] font-bold bg-gray-900 border border-gray-700 rounded text-white ${isPenDisabled ? 'opacity-50 cursor-not-allowed' : ''}`} />
+              {isESPNFinished && !isPenDisabled && (
+                <span className="text-[9px] text-teal-400 font-bold ml-1">← isi penalti</span>
+              )}
             </div>
           )}
 
-          {/* v1.4.2: Knockout Prediction Panel — State B (locked, not played) */}
+          {/* Prediction Panel — State B: locked, awaiting result */}
           {isKnockoutLocked && !m.played && (
             <div className="pred-panel locked mt-1.5">
               <div className="text-[10px] text-wc-primary font-bold">
@@ -2208,7 +2414,7 @@
             </div>
           )}
 
-          {/* v1.4.2: Knockout Prediction Panel — State C (locked + played) */}
+          {/* Prediction Panel — State C: locked + result known */}
           {isKnockoutLocked && m.played && predResult && (
             <div className={`pred-panel locked ${panelClass} mt-1.5`}>
               <div className="text-[10px] text-gray-400">
@@ -2326,6 +2532,53 @@
             espnSource: true,
           };
         }));
+      }, [liveData, phase]);
+
+      // B2: Auto-apply ESPN scores to all knockout bracket rounds (phase ≥ 2).
+      // Mechanism is identical to group stage — lookup by sorted team-ID pair key.
+      // Regulation scores (gA/gB) are auto-filled; penalty fields stay user-controlled
+      // because ESPN scoreboard does not expose shootout results.
+      // A tied regulation score (gA === gB) marks the match as ESPN-controlled but
+      // NOT played=true yet — user must still enter penalties to unlock progression.
+      useEffect(() => {
+        if (phase < 2 || Object.keys(liveData).length === 0) return;
+        const rounds = ['r32', 'r16', 'qf', 'sf', 'final'];
+        setBracketMatches(prev => {
+          let changed = false;
+          const next = {};
+          rounds.forEach(round => {
+            if (!prev[round]?.length) { next[round] = prev[round] || []; return; }
+            next[round] = prev[round].map(m => {
+              // Skip TBD slots — teams not yet determined for this match
+              if (!m.teamA?.id || !m.teamB?.id) return m;
+              const key = [m.teamA.id, m.teamB.id].sort().join('|');
+              const live = liveData[key];
+              if (!live || live.homeScore === null || live.awayScore === null) return m;
+              const isFinished = live.completed === true || live.state === 'post';
+              const isLive = live.state === 'in';
+              if (!isFinished && !isLive) return m;
+              const homeFirst = live.homeId === m.teamA.id;
+              const gA = homeFirst ? live.homeScore : live.awayScore;
+              const gB = homeFirst ? live.awayScore : live.homeScore;
+              // Decisive regulation result — winner is known, no penalties needed
+              const notTied = gA !== gB;
+              const played  = isFinished && notTied;
+              const winner  = played ? (gA > gB ? m.teamA.id : m.teamB.id) : m.winner;
+              changed = true;
+              return {
+                ...m, gA, gB,
+                played,
+                winner,
+                espnState: isFinished ? 'post' : 'in',
+                espnSource: true,
+                displayClock: live.displayClock || m.displayClock || '',
+                playedAt: (played && !m.playedAt) ? Date.now() : m.playedAt,
+              };
+            });
+          });
+          // Bail out if nothing changed — avoid unnecessary re-renders
+          return changed ? next : prev;
+        });
       }, [liveData, phase]);
 
       // Auto-show winner modal when final is completed
@@ -2635,8 +2888,18 @@
            const matches = [...prev[round]];
            const idx = matches.findIndex(m => m.id === id);
            if (idx === -1) return prev;
-           
-           const m = { ...matches[idx], [field]: num };
+
+           const existing = matches[idx];
+           // B3: Regulation score fields are read-only when ESPN has official data.
+           // Penalty fields (pensA/pensB) are ALWAYS user-controlled — ESPN scoreboard
+           // does not expose penalty shootout results, so user must enter them manually.
+           const isRegField = field === 'gA' || field === 'gB';
+           if (isRegField && existing.espnSource &&
+               (existing.espnState === 'in' || existing.espnState === 'post')) {
+             return prev; // silently block — ESPN owns the regulation score
+           }
+
+           const m = { ...existing, [field]: num };
            if (m.gA !== '' && m.gB !== '') {
               if (m.gA > m.gB) { m.winner = m.teamA.id; m.played = true; }
               else if (m.gB > m.gA) { m.winner = m.teamB.id; m.played = true; }
@@ -2647,7 +2910,7 @@
               }
            } else { m.played = false; m.winner = null; }
            // v1.4.4 fairness: record timestamp the first time a match result is entered
-           if (m.played && !matches[idx].played) m.playedAt = Date.now();
+           if (m.played && !existing.played) m.playedAt = Date.now();
            matches[idx] = m;
            return { ...prev, [round]: matches };
         });
@@ -2840,7 +3103,7 @@
               <div>
                 <h1 className="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-wc-primary to-wc-accent tracking-tighter">FIFA WORLD CUP 2026™</h1>
                 <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                  <span className="text-[10px] text-gray-600 font-mono">v1.4.4</span>
+                  <span className="text-[10px] text-gray-600 font-mono">v1.5</span>
                   {liveLastFetch && (
                     <span className="text-[10px] text-gray-600">
                       · ESPN: {liveLastFetch.toLocaleTimeString('id-ID', {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
