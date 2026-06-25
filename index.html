@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FIFA World Cup 2026 Playoff Simulator v1.5</title>
+  <title>FIFA World Cup 2026 Playoff Simulator v1.5.2</title>
   
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -2021,34 +2021,48 @@
       return { events: 0, mapped: 0, reason };
     };
 
-    // v1.5 A3+A4: fetchESPNScores improvements:
-    //   • Global 30s AbortController — aborts all pending requests if exceeded (A4)
+    // v1.5.2 A3+A4: fetchESPNScores improvements:
+    //   • Global 120s AbortController — extended for cold-start with no localStorage cache (A4)
     //   • Smart skip: historical dates fully served from cache won't hit the network (A3)
-    const fetchESPNScores = async () => {
+    //   • Past WC dates now fetched in parallel BATCHES — fixes Vercel cold-start bug
+    //   • Progressive updates via onProgress callback — UI shows results as they arrive
+    //
+    // BUG FIX (v1.5.2): On Vercel (new domain), localStorage is EMPTY on first visit.
+    // All 40+ tournament dates must be fetched fresh. The old sequential strategy +
+    // 30s timeout meant Jun 11-21 results were NEVER fetched before abort.
+    // Solution: batch past dates 6-at-a-time → ~6x faster, completes within timeout.
+    const fetchESPNScores = async (onProgress) => {
       const allDates = extractFixtureDates();
       const results = {};
       let totalEvents = 0;
       const fetchLog = [];
 
-      // A4: Global timeout — if the whole operation takes >30s, abort everything
+      // A4: Global timeout — extended to 120s for cold-start (Vercel / new domain)
+      // On first visit, all 40+ dates need fresh network requests through CORS proxies.
+      // 30s was enough when cache was warm (GitHub Pages), but not for cold starts.
       const globalCtrl = new AbortController();
       const globalTimeout = setTimeout(() => {
         globalCtrl.abort();
-        console.warn('[WC2026] ⏱ Global 30s timeout — aborting remaining ESPN requests');
-      }, 30000);
+        console.warn('[WC2026] ⏱ Global 120s timeout — aborting remaining ESPN requests');
+      }, 120000);
 
-      // Separate today ±3 (priority) from the rest
-      const todayStr = new Date().toISOString().slice(0,10).replace(/-/g,'');
+      // Categorize dates into 3 buckets:
+      //   priority  → today ±3: fetched in PARALLEL (may be live/in-progress)
+      //   pastDates → before today-3: fetched in parallel BATCHES (scores are final, safe)
+      //   futureDates → after today+3: fetched SEQUENTIALLY (mostly empty, low priority)
+      const todayNum = parseInt(new Date().toISOString().slice(0,10).replace(/-/g,''));
       const priorityDates = [];
-      const otherDates = [];
+      const pastDates = [];
+      const futureDates = [];
       allDates.forEach(d => {
-        const diff = Math.abs(parseInt(d) - parseInt(todayStr));
-        if (diff <= 3) priorityDates.push(d);
-        else otherDates.push(d);
+        const diff = parseInt(d) - todayNum;
+        if (Math.abs(diff) <= 3) priorityDates.push(d);
+        else if (diff < -3) pastDates.push(d);
+        else futureDates.push(d);
       });
 
       try {
-        // Priority dates — fetch in PARALLEL (live & recent matches need low latency)
+        // 1. Priority dates — fetch in PARALLEL (live & recent matches need low latency)
         console.log('[WC2026] Fetching', priorityDates.length, 'priority dates in parallel...');
         const priorityResults = await Promise.allSettled(
           priorityDates.map(d => _fetchOneDate(d, results, globalCtrl.signal))
@@ -2060,11 +2074,35 @@
             fetchLog.push(`${tag}${priorityDates[i]}: ${r.value.events}ev ${r.value.mapped}mapped`);
           }
         });
+        // Progressive update: push today's results to UI immediately
+        if (onProgress) onProgress(Object.assign({}, results));
 
-        // Other WC dates — fetch SEQUENTIALLY (saves bandwidth; most are historical)
-        // A3: Dates fully cached will return immediately without hitting the network
-        console.log('[WC2026] Fetching', otherDates.length, 'other WC dates sequentially...');
-        for (const d of otherDates) {
+        // 2. Past WC dates — fetch in parallel BATCHES of 6
+        //    These are completed matches (scores final), so parallel fetching is safe.
+        //    6-at-a-time is ~6x faster than sequential, fitting within the 120s window
+        //    even on a cold start with all 14+ past dates needing fresh network requests.
+        const BATCH_SIZE = 6;
+        console.log('[WC2026] Fetching', pastDates.length, 'past WC dates in batches of', BATCH_SIZE, '...');
+        for (let bi = 0; bi < pastDates.length; bi += BATCH_SIZE) {
+          if (globalCtrl.signal.aborted) break;
+          const batch = pastDates.slice(bi, bi + BATCH_SIZE);
+          const batchResults = await Promise.allSettled(
+            batch.map(d => _fetchOneDate(d, results, globalCtrl.signal))
+          );
+          batchResults.forEach((r, k) => {
+            if (r.status === 'fulfilled' && r.value.events > 0) {
+              totalEvents += r.value.events;
+              const tag = r.value.fromCache ? '📦' : '🌐';
+              fetchLog.push(`${tag}${batch[k]}: ${r.value.events}ev ${r.value.mapped}mapped`);
+            }
+          });
+          // Progressive update after each batch — past match results appear incrementally
+          if (onProgress) onProgress(Object.assign({}, results));
+        }
+
+        // 3. Future dates — sequential (mostly empty responses, keep proxy traffic low)
+        console.log('[WC2026] Fetching', futureDates.length, 'future WC dates sequentially...');
+        for (const d of futureDates) {
           if (globalCtrl.signal.aborted) break;
           const r = await _fetchOneDate(d, results, globalCtrl.signal);
           if (r.events > 0) {
@@ -2485,7 +2523,9 @@
       const doFetchLive = useCallback(async () => {
         setLiveLoading(true);
         try {
-          const result = await fetchESPNScores();
+          const result = await fetchESPNScores((progressiveData) => {
+            setLiveData(progressiveData);
+          });
           setLiveData(result.data);
           setLiveLastFetch(new Date());
         } catch(e) {
@@ -2801,7 +2841,9 @@
         let espnResult = { data: {}, log: [], totalEvents: 0 };
         let fetchError = null;
         try {
-          espnResult = await fetchESPNScores();
+          espnResult = await fetchESPNScores((progressiveData) => {
+            setLiveData(progressiveData);
+          });
           setLiveData(espnResult.data);
           setLiveLastFetch(new Date());
         } catch(e) {
@@ -3103,7 +3145,7 @@
               <div>
                 <h1 className="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-wc-primary to-wc-accent tracking-tighter">FIFA WORLD CUP 2026™</h1>
                 <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                  <span className="text-[10px] text-gray-600 font-mono">v1.5</span>
+                  <span className="text-[10px] text-gray-600 font-mono">v1.4.4</span>
                   {liveLastFetch && (
                     <span className="text-[10px] text-gray-600">
                       · ESPN: {liveLastFetch.toLocaleTimeString('id-ID', {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
